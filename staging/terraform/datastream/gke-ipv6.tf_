@@ -1,0 +1,145 @@
+# # Service account for the deployments.
+# resource "kubernetes_service_account_v1" "deployments" {
+#   metadata {
+#     name = "miapp-staging-deployments"
+#     annotations = tomap({
+#       "iam.gke.io/gcp-service-account" = var.google_service_account_deployment_email
+#     })
+#   }
+#   depends_on = [ google_container_cluster.primary_worker_ipv6 ]
+# }
+
+# Subnet in VPC.
+resource "google_compute_subnetwork" "vpc_subnet_gke_ipv6" {
+  name          = "${var.gcloud_project_id}-vpc-subnet-gke-ipv6"
+  ip_cidr_range = var.vpc_subnet_worker_ip_cidr_range
+  network       = data.google_compute_network.vpc.id
+  # IPV4_ONLY IPV4_IPV6 # forces replacement.
+  # Add for suppor IPV6 external.
+  stack_type       = "IPV4_ONLY"
+  # ipv6_access_type = "EXTERNAL"
+  secondary_ip_range {
+    ip_cidr_range = var.vpc_subnet_worker_pods_cidr_range
+    range_name    = "pods"
+  }
+  secondary_ip_range {
+    ip_cidr_range = var.vpc_subnet_worker_services_cidr_range
+    range_name    = "services"
+  }
+}
+
+# GKE cluster
+resource "google_container_cluster" "primary_worker_ipv6" {
+  provider = google-beta
+  name     = "${var.gcloud_project_id}-gke-ipv6"
+  location = var.gcloud_zone
+  # We can't create a cluster with no node pool defined, but we want to only use
+  # separately managed node pools. So we create the smallest possible default
+  # node pool and immediately delete it.
+  remove_default_node_pool = true
+  initial_node_count       = 1
+  # Network.
+  network = data.google_compute_network.vpc.self_link
+  subnetwork = google_compute_subnetwork.vpc_subnet_gke_ipv6.name
+  networking_mode = "VPC_NATIVE"
+
+  ip_allocation_policy {
+
+
+    # Both defined in google_compute_subnetwork.vpc_subnet.
+    cluster_secondary_range_name  = "pods"
+    services_secondary_range_name = "services"
+    #"IPV4" -> "IPV4_IPV6"
+    # stack_type = "IPV4"
+  }
+  monitoring_config {
+    enable_components = ["SYSTEM_COMPONENTS"]
+  }
+
+  #Node Autoscaling
+  addons_config {
+    horizontal_pod_autoscaling {
+      disabled = true
+    }
+  }
+
+  logging_config {
+    enable_components = [ "SYSTEM_COMPONENTS","WORKLOADS" ]
+  }
+
+  workload_identity_config {
+    workload_pool = "${var.gcloud_project_id}.svc.id.goog"
+  }
+
+
+  maintenance_policy {
+    recurring_window {
+      start_time = "2023-02-16T08:00:00Z"
+      end_time = "2023-02-16T12:00:00Z"
+      recurrence = "FREQ=WEEKLY;BYDAY=TU,TH,FR"
+    }
+  }
+
+  # notification_config {
+  #   pubsub {
+  #     enabled = true
+  #     topic = google_pubsub_topic.gke_notification_pub_sub.id
+  #   }
+  # }
+
+}
+
+# Primary node pool.
+# @note If we wanted to, we could create different node pools for each service.
+resource "google_container_node_pool" "primary_nodes_worker_ipv6" {
+  name       = "${google_container_cluster.primary_worker_ipv6.name}-node-pool-ipv6"
+  # If using var.gcloud_region, var.gke_num_nodes per zone in the region will be provisioned.
+  location   = var.gcloud_zone
+  cluster    = google_container_cluster.primary_worker_ipv6.name
+  node_config {
+    service_account = var.google_service_account_deployment_email
+    oauth_scopes = [
+      "https://www.googleapis.com/auth/cloud-platform",
+    ]
+    labels = {
+      env = "${var.gcloud_project_id}"
+    }
+    preemptible = true
+    machine_type = "n2-standard-2"
+    tags         = ["gke-node", "${var.gcloud_project_id}-gke-worker"]
+    metadata = {
+      // Set metadata on the VM to supply more entropy.
+      google-compute-enable-virtio-rng = "true"
+      // Explicitly remove GCE legacy metadata API endpoint.
+      disable-legacy-endpoints = "true"
+    }
+    workload_metadata_config {
+      mode = "GKE_METADATA"
+    }
+  }
+
+  management {
+    auto_repair  = true
+    auto_upgrade = true
+  }
+
+  # dynamic "autoscaling" {
+  #   for_each = var.horizontal_pod_autoscaling == true ? [1] : []
+  #   content {
+  #     location_policy = "BALANCED"
+  #     min_node_count = var.gke_worker_min_node_count
+  #     max_node_count = var.gke_worker_max_node_count
+  #   }
+  # }
+
+  upgrade_settings {
+    strategy = "BLUE_GREEN"
+    blue_green_settings {
+      node_pool_soak_duration = "10s"
+      standard_rollout_policy {
+        batch_node_count = 1
+        batch_soak_duration = "30s"
+      }
+    }
+  }
+}
